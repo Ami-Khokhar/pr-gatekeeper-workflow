@@ -1,0 +1,172 @@
+# Reusable workflow that reviews a pull request in two isolated jobs.
+#
+# Target repos call this workflow from their own `.github/workflows/pr-gatekeeper.yml`
+# (see `templates/pr-gatekeeper.yml`). It checks out the PR head of the *target*
+# repository, checks out pr-gatekeeper outside that tree, and runs the CLI.
+#
+# SECURITY: two jobs, because PR code and secrets must never share a runner.
+# On Linux a process can read the environment of its parent through
+# /proc/<ppid>/environ, so scrubbing the child environment is not enough.
+# - job `gates` runs the deterministic stages (changes, static config, verify,
+#   base compare, revert probe) on the PR code with NO model/API secrets and no
+#   GH_TOKEN, and uploads the result as an artifact.
+# - job `review` holds the secrets, never executes PR code, and reads the gate
+#   results from the artifact instead of re-running the proof commands.
+
+name: gatekeeper
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: "Pull request number to review"
+        required: true
+        type: number
+      base_sha:
+        description: "SHA of the PR base (resolved by the caller; job gates must not call the GitHub API)"
+        required: true
+        type: string
+      gatekeeper_ref:
+        description: "pr-gatekeeper ref to check out"
+        required: false
+        type: string
+        default: v1
+    secrets:
+      OPENCODE_GO_API_KEY:
+        description: "API key for the reviewer/verifier models"
+        required: true
+      GATEKEEPER_READ_TOKEN:
+        description: "Optional token that can read the private Ami-Khokhar/pr-gatekeeper repo"
+        required: false
+
+jobs:
+  gates:
+    # Deterministic stages on the PR code: no model API key, no GH_TOKEN.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # persist-credentials is false so that the checked-out PR code cannot
+      # find a GitHub token in .git/config. fetch-depth 0 fetches all refs,
+      # so the base commit is present for the merge-base computation.
+      - name: Check out the target repository at the PR head
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr }}/head
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The tool is checked out and moved out of the reviewed tree BEFORE any
+      # PR code runs, so it is never part of the diff and never writeable by
+      # the PR.
+      - name: Check out pr-gatekeeper
+        uses: actions/checkout@v4
+        with:
+          repository: Ami-Khokhar/pr-gatekeeper
+          ref: ${{ inputs.gatekeeper_ref }}
+          path: .pr-gatekeeper-tool
+          token: ${{ secrets.GATEKEEPER_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Move pr-gatekeeper outside the reviewed repository
+        run: mv .pr-gatekeeper-tool "${{ runner.temp }}/pr-gatekeeper"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      # PR code runs only here, in the `gates` job, with a scrubbed
+      # environment (see gatekeeper/env.py). No secrets exist in this job.
+      - name: Run the deterministic gates
+        working-directory: ${{ runner.temp }}/pr-gatekeeper
+        run: |
+          python3 -m gatekeeper gates \
+            --repo-dir "$GITHUB_WORKSPACE" \
+            --base-ref-oid "${{ inputs.base_sha }}" \
+            --out "$RUNNER_TEMP/gates.json"
+
+      # Write the artifact outside the reviewed tree, so PR code cannot
+      # rewrite it after it was produced.
+      - name: Upload gates.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: gates-${{ inputs.pr }}
+          path: ${{ runner.temp }}/gates.json
+          retention-days: 1
+
+  review:
+    needs: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      checks: write
+      actions: write
+    steps:
+      # The PR head is checked out for READING only: nothing here executes
+      # repository code (the reviewer tools are read-only, and the gates
+      # already ran in job `gates`).
+      - name: Check out the target repository at the PR head
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr }}/head
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Safety net: make sure the base branch tip exists even if the initial
+      # checkout missed it. The token is never echoed and the URL is never
+      # printed (output is captured and scrubbed on failure).
+      - name: Ensure the base branch refs exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          if ! out=$(git fetch --no-tags "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" +refs/heads/*:refs/remotes/origin/* 2>&1); then
+            printf '%s\n' "$out" | sed -E 's#x-access-token:[^@]+@#x-access-token:***@#g'
+            exit 1
+          fi
+
+      - name: Check out pr-gatekeeper
+        uses: actions/checkout@v4
+        with:
+          repository: Ami-Khokhar/pr-gatekeeper
+          ref: ${{ inputs.gatekeeper_ref }}
+          path: .pr-gatekeeper-tool
+          token: ${{ secrets.GATEKEEPER_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Move pr-gatekeeper outside the reviewed repository
+        run: mv .pr-gatekeeper-tool "${{ runner.temp }}/pr-gatekeeper"
+
+      - name: Download gates.json from job gates
+        uses: actions/download-artifact@v4
+        with:
+          name: gates-${{ inputs.pr }}
+          path: ${{ runner.temp }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The reviewer tools are read-only here; the deterministic gate results
+      # come from gates.json (head_sha is re-checked against the PR head).
+      # GH_TOKEN is for the `gh` publish steps only.
+      - name: Run the review
+        working-directory: ${{ runner.temp }}/pr-gatekeeper
+        env:
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m gatekeeper review \
+            --repo "${{ github.repository }}" \
+            --pr "${{ inputs.pr }}" \
+            --repo-dir "$GITHUB_WORKSPACE" \
+            --gates-json "$RUNNER_TEMP/gates.json"
