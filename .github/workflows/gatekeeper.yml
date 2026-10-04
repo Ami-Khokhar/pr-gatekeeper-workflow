@@ -5,8 +5,9 @@
 # repository, checks out pr-gatekeeper outside that tree, and runs the CLI.
 #
 # SECURITY: two jobs, because PR code and secrets must never share a runner.
-# On Linux a process can read the environment of its parent through
-# /proc/<ppid>/environ, so scrubbing the child environment is not enough.
+# A process can read the environment of its parent: on Linux through
+# /proc/<ppid>/environ, on macOS through `ps eww` (same user). So scrubbing
+# the child environment is not enough, on either OS.
 # - job `pr_body` reads the PR body with a read-only token and runs NO PR code;
 #   it hands the body to job `gates` as an artifact.
 # - job `gates` runs the deterministic stages (changes, static config, verify,
@@ -14,6 +15,15 @@
 #   model/API secrets and no GH_TOKEN, and uploads the result as an artifact.
 # - job `review` holds the secrets, never executes PR code, and reads the gate
 #   results from the artifact instead of re-running the proof commands.
+#
+# RUNNER: job `gates` runs on the label in `gates_runs_on` (default
+# ubuntu-latest; macos-latest for an iOS/macOS repo). Only GitHub-hosted
+# labels (ubuntu-*, macos-*) are accepted: job `pr_body` rejects anything
+# else, so a caller cannot point PR code at a self-hosted runner that keeps
+# state between runs. On macOS the isolation is the same as on Linux: a fresh
+# single-use VM per run, the two-job split (no secret and no token in the job
+# that runs PR code) and the scrubbed child environment. Jobs `pr_body` and
+# `review` always run on ubuntu-latest.
 
 name: gatekeeper
 
@@ -37,6 +47,11 @@ on:
         required: false
         type: string
         default: v1
+      gates_runs_on:
+        description: "GitHub-hosted runner label for job gates (the job that runs the PR's verify command): ubuntu-latest (default) or macos-latest for an iOS/macOS repo. Self-hosted labels are refused."
+        required: false
+        type: string
+        default: ubuntu-latest
     secrets:
       OPENCODE_GO_API_KEY:
         description: "API key for the reviewer/verifier models"
@@ -61,11 +76,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr }}
+          GATES_RUNS_ON: ${{ inputs.gates_runs_on }}
         run: |
           set -euo pipefail
           case "$PR_NUMBER" in
             ''|*[!0-9]*) echo "::error::input pr must be a PR number, got '$PR_NUMBER'"; exit 1 ;;
           esac
+          # Job gates runs PR code: only a GitHub-hosted label may select its
+          # runner. A self-hosted runner can keep state between runs.
+          if ! printf '%s' "$GATES_RUNS_ON" | grep -Eqx '(ubuntu|macos)-[a-z0-9.-]+'; then
+            echo "::error::input gates_runs_on must be a GitHub-hosted label (ubuntu-* or macos-*), got '$GATES_RUNS_ON'"; exit 1
+          fi
           gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
             --json body -q .body > "$RUNNER_TEMP/pr-body.md"
 
@@ -79,7 +100,7 @@ jobs:
   gates:
     # Deterministic stages on the PR code: no model API key, no GH_TOKEN.
     needs: pr_body
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.gates_runs_on }}
     timeout-minutes: 45
     permissions:
       contents: read
