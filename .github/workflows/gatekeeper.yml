@@ -43,7 +43,7 @@ on:
         required: true
         type: string
       gatekeeper_ref:
-        description: "pr-gatekeeper ref to check out"
+        description: "Gate revision: a full 40-character commit sha to freeze the gate, or v1 (default) to follow the release channel in pr-gatekeeper-workflow/gatekeeper-version.json"
         required: false
         type: string
         default: v1
@@ -62,14 +62,55 @@ on:
 
 jobs:
   pr_body:
-    # Reads the PR body for the Proof-of-work replay. It never checks out or
-    # runs PR code, so its token never meets PR code; job `gates` gets the
-    # body as a file and holds no token.
+    # Reads the PR body for the Proof-of-work replay and resolves the gate
+    # revision. It never checks out or runs PR code, so its token never meets
+    # PR code; job `gates` gets the body as a file and holds no token.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       pull-requests: read
+    outputs:
+      gate_revision: ${{ steps.revision.outputs.gate_revision }}
     steps:
+      # The gate revision comes from one file, so a release is one edit there
+      # and no caller changes. A caller may still pass a full sha in
+      # `gatekeeper_ref` to freeze its gate.
+      - name: Resolve the gate revision
+        id: revision
+        env:
+          GATEKEEPER_REF: ${{ inputs.gatekeeper_ref }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$GATEKEEPER_REF" | grep -Eqx '[0-9a-f]{40}'; then
+            echo "gate_revision=$GATEKEEPER_REF" >> "$GITHUB_OUTPUT"
+            echo "gate revision: $GATEKEEPER_REF (frozen by the caller)"
+            exit 0
+          fi
+          if [ "$GATEKEEPER_REF" != "v1" ]; then
+            echo "::error::input gatekeeper_ref must be a full 40-character commit sha, or v1 to follow the release channel; got '$GATEKEEPER_REF'"
+            exit 1
+          fi
+          url="https://raw.githubusercontent.com/Ami-Khokhar/pr-gatekeeper-workflow/v1/gatekeeper-version.json"
+          if ! curl -fsSL --max-time 30 "$url" -o "$RUNNER_TEMP/gatekeeper-version.json"; then
+            echo "::error::could not read the release version from $url"
+            exit 1
+          fi
+          rev=$(python3 - "$RUNNER_TEMP/gatekeeper-version.json" <<'PY'
+          import json, re, sys
+          try:
+              data = json.load(open(sys.argv[1]))
+          except Exception as exc:
+              sys.exit("version file is not valid JSON: %s" % exc)
+          if not isinstance(data, dict) or data.get("schema") != 1:
+              sys.exit("version file schema must be 1")
+          rev = data.get("gate_revision")
+          if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
+              sys.exit("version file gate_revision must be a 40-character commit sha")
+          print(rev)
+          PY
+          )
+          echo "gate_revision=$rev" >> "$GITHUB_OUTPUT"
+          echo "gate revision: $rev (release channel v1)"
       # `pr` is a string input, so it reaches the shell through env. Every
       # other job needs this one, so a bad value stops the whole review here.
       - name: Fetch the PR body
@@ -122,7 +163,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Ami-Khokhar/pr-gatekeeper
-          ref: ${{ inputs.gatekeeper_ref }}
+          ref: ${{ needs.pr_body.outputs.gate_revision }}
           path: .pr-gatekeeper-tool
           token: ${{ secrets.GATEKEEPER_READ_TOKEN || github.token }}
           persist-credentials: false
@@ -172,7 +213,7 @@ jobs:
           retention-days: 1
 
   review:
-    needs: gates
+    needs: [pr_body, gates]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -209,7 +250,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Ami-Khokhar/pr-gatekeeper
-          ref: ${{ inputs.gatekeeper_ref }}
+          ref: ${{ needs.pr_body.outputs.gate_revision }}
           path: .pr-gatekeeper-tool
           token: ${{ secrets.GATEKEEPER_READ_TOKEN || github.token }}
           persist-credentials: false

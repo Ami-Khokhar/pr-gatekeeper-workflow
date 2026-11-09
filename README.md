@@ -14,3 +14,16 @@ Callers reference it as:
 ```yaml
 uses: Ami-Khokhar/pr-gatekeeper-workflow/.github/workflows/gatekeeper.yml@v1
 ```
+
+## Release channel
+
+`gatekeeper-version.json` in this repository holds the gate revision that every
+caller following `v1` runs. The workflow reads it at run time (job `pr_body`
+fetches it, validates `schema` and the commit sha, and passes the commit to
+`gates` and `review`). A release is one edit to that file. A caller that needs a
+stable gate passes a full commit sha in `gatekeeper_ref` instead of `v1`.
+
+The file is the release trust anchor: it is public, and changing it changes the
+gate for every caller on `v1`. Put the new sha here only after the gate repository
+passes its own verify command and its interface metadata compares compatible with
+the previous release.
