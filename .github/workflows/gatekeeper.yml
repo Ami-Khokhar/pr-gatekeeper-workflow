@@ -140,9 +140,12 @@ jobs:
 
   gates:
     # Deterministic stages on the PR code: no model API key, no GH_TOKEN.
+    # 90 minutes: the verified suite, the revert probe and the proof replay
+    # each run the repository's tests, and a 45-minute budget cancelled
+    # reviews for agent-relay PRs #350/#352/#358 with no verdict.
     needs: pr_body
     runs-on: ${{ inputs.gates_runs_on }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
