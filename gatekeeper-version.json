@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "gate_revision": "8364d6214a829c37c40ec7aa7b9c53edbbef05ea",
-  "released_at": "2026-11-09T22:18:00+05:30",
+  "gate_revision": "e7d16a825dc362e6d0438037b4e04bd6495328dc",
+  "released_at": "2026-11-14T11:15:00+05:30",
   "note": "The gate revision every caller that follows v1 runs. Update this one file for a release; callers never change."
 }
