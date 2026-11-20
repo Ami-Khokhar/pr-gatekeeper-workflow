@@ -272,6 +272,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Stage 3's default engine (reviewer_engine: ocr). Pinned: a different
+      # reviewer is a behaviour change, not an install detail. A missing
+      # binary or a failed install fails the run, which escalates instead of
+      # merging. Harmless for a gate revision that still runs the llm engine.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install ocr
+        run: npm install --global --no-audit --no-fund @alibaba-group/open-code-review@1.13.13
+
       # The reviewer tools are read-only here; the deterministic gate results
       # come from gates.json (head_sha is re-checked against the PR head).
       # GH_TOKEN is for the `gh` publish steps only. `pr` is a string input,
